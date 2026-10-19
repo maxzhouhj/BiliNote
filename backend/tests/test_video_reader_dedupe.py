@@ -112,6 +112,21 @@ def _make_fake_ffmpeg_runner(colors_by_second):
 
 
 class TestVideoReaderDeduplicateFrames(unittest.TestCase):
+    def test_frames_work_without_a_separate_ffprobe_executable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reader = VideoReader(video_path="dummy.mp4", frame_interval=1,
+                                 frame_dir=str(pathlib.Path(tmp_dir) / "frames"),
+                                 grid_dir=str(pathlib.Path(tmp_dir) / "grids"))
+            container = types.SimpleNamespace(duration=2_000_000)
+            from contextlib import nullcontext
+            av_module = types.SimpleNamespace(open=lambda _path: nullcontext(container))
+            with patch.object(video_reader_module.ffmpeg, "probe", side_effect=FileNotFoundError), \
+                    patch.dict(sys.modules, {"av": av_module}), \
+                    patch.object(video_reader_module.subprocess, "run",
+                                 side_effect=_make_fake_ffmpeg_runner({0: b"frame-a", 1: b"frame-b"})):
+                paths = reader.extract_frames(max_frames=2)
+            self.assertEqual(len(paths), 2)
+
     def test_extract_frames_skips_adjacent_duplicates_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             frame_dir = pathlib.Path(tmp_dir) / "frames"

@@ -1,6 +1,9 @@
 import datetime
 import json
 import os
+import logging
+import subprocess
+import tempfile
 import re
 from typing import Union, Optional
 from urllib.parse import quote, urlencode
@@ -20,7 +23,8 @@ from dotenv import load_dotenv
 load_dotenv()
 DOUYIN_DOMAIN = "https://www.douyin.com"
 
-cfm=CookieConfigManager()
+logger = logging.getLogger(__name__)
+cfm = CookieConfigManager()
 def get_timestamp(unit: str = "milli"):
     """
     根据给定的单位获取当前时间 (Get the current time based on the given unit)
@@ -49,6 +53,8 @@ class DouyinConfig:
         "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36",
         "Referer": "https://www.douyin.com/",
+        "Accept": "application/json, text/plain, */*",
+        "x-tt-argus": "1",
         "Cookie": None
     }
 
@@ -113,36 +119,40 @@ class DouyinDownloader(Downloader):
     def __init__(self, cookie=None):
         super().__init__()
         self.headers_config = DouyinConfig.HEADERS.copy()
-        self.headers_config["Cookie"] = cfm.get('douyin')
-        print(self.headers_config)
+        self.cookie = cookie
+        self.headers_config["Cookie"] = cookie if cookie is not None else cfm.get("douyin")
         self.proxies_config = DouyinConfig.PROXIES.copy()
         self.ttwid_config = DouyinConfig.TTWID.copy()
         self.ms_token_config = DouyinConfig.MS_TOKEN.copy()
 
+    def _request_headers(self):
+        headers = self.headers_config.copy()
+        cookie = self.cookie if self.cookie is not None else cfm.get("douyin")
+        if cookie:
+            headers["Cookie"] = cookie
+        else:
+            headers.pop("Cookie", None)
+        return headers
+
     @staticmethod
     def find_url(string: str) -> list:
-        url = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', string)
-        return url
+        return re.findall(r"https?://[^\s<>\"]+", string)
 
     def extract_video_id(self, url: str) -> str:
-        video_url = self.find_url(url)
+        def match_id(value):
+            match = re.search(r"(?:/video/|aweme_id=)(\d+)", value)
+            return match.group(1) if match else ""
 
-        if len(video_url):
-            video_url = video_url[0]
-            try:
-                response = requests.head(video_url, allow_redirects=True)
-                url = response.url
-            except Exception as e:
-                return ""
-        patterns = [
-            r'video/(\d+)',
-            r'aweme_id=(\d+)',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return ""
+        if match_id(url):
+            return match_id(url)
+        urls = self.find_url(url)
+        if not urls:
+            return ""
+        try:
+            response = requests.head(urls[0], allow_redirects=True, timeout=20)
+            return match_id(response.url)
+        except requests.RequestException:
+            return ""
 
     def gen_real_msToken(self) -> str:
         try:
@@ -177,128 +187,123 @@ class DouyinDownloader(Downloader):
         except Exception as e:
             raise ValueError("Douyin msToken API{0}".format(e))
 
-    def fetch_video_info(self, video_url: str) -> json:
+    def fetch_video_info(self, video_url: str) -> dict:
+        aweme_id = self.extract_video_id(video_url)
+        if not aweme_id:
+            raise ValueError("无法提取抖音视频 ID，请使用有效的单个视频链接")
+        headers = self._request_headers()
+        params = BaseRequestModel().model_dump()
+        params["msToken"] = self.gen_real_msToken()
+        params["aweme_id"] = aweme_id
+        signature = quote(ABogus().get_value(params), safe="")
+        url = f"{DOUYIN_DOMAIN}/aweme/v1/web/aweme/detail/?{urlencode(params)}&a_bogus={signature}"
         try:
-
-            aweme_id = self.extract_video_id(video_url)
-            kwargs = self.headers_config
-            print("@kwargs:", kwargs)
-            base_params = BaseRequestModel().model_dump()
-            base_params["msToken"] = self.gen_real_msToken()
-
-            base_params["aweme_id"] = aweme_id
-            bogus = ABogus()
-            ab_value = bogus.get_value(base_params)
-            a_bogus = quote(ab_value, safe='')
-            print("@a_bogus:", a_bogus)
-            print(base_params)
-            query_str = urlencode(base_params)
-            full_url = f"{DOUYIN_DOMAIN}/aweme/v1/web/aweme/detail/?{query_str}&a_bogus={a_bogus}"
-
-            print("Request URL:", full_url)
-
-
-            response = requests.get(full_url, headers=kwargs)
-
-            print("Response JSON:", response.content)
-            return response.json()
-        except Exception as e:
-            print("请求失败:", e)
-            raise ValueError("请求失败:", e)
-        # print(kwargs)
-
-    def download(
-            self,
-            video_url: str,
-            output_dir: Union[str, None] = None,
-            quality: DownloadQuality = "fast",
-            need_video: Optional[bool] = False
-    ) -> AudioDownloadResult:
+            response = requests.get(url, headers=headers, timeout=30)
+        except requests.RequestException:
+            raise ValueError("抖音详情请求失败：网络连接异常或请求超时") from None
+        logger.info("抖音详情响应：video_id=%s HTTP=%s content_type=%s bytes=%s",
+                    aweme_id, response.status_code,
+                    response.headers.get("Content-Type", "unknown"), len(response.content))
+        if response.status_code >= 400:
+            # Only include recognized gateway messages; never log arbitrary response bodies or signed URLs.
+            reason = next((message for message in (
+                "Uifid Not Found", "Signature Not Found") if message in response.text), "请求被拒绝")
+            raise ValueError(f"抖音详情请求失败：HTTP {response.status_code}，{reason}；请检查最新 Cookie 和请求签名")
+        if not response.content.strip():
+            raise ValueError("抖音详情接口返回空响应，请检查 Cookie 或稍后重试")
         try:
-            print(
-                f"正在下载视频: {video_url}，保存路径: {output_dir}，质量: {quality}"
-            )
-            if output_dir is None:
-                output_dir = get_data_dir()
-            if not output_dir:
-                output_dir = self.cache_data
-            os.makedirs(output_dir, exist_ok=True)
+            data = response.json()
+        except ValueError:
+            raise ValueError("抖音详情接口返回非 JSON 内容，可能触发验证或接口已变更") from None
+        if not isinstance(data, dict):
+            raise ValueError("抖音详情接口返回的数据格式无效")
+        if not isinstance(data.get("aweme_detail"), dict) or not data["aweme_detail"]:
+            filter_detail = data.get("filter_detail") or {}
+            reason = filter_detail.get("filter_reason", "作品不可见或已失效") if isinstance(filter_detail, dict) else "作品不可见或已失效"
+            raise ValueError(f"无法获取抖音作品：{reason}")
+        return data
 
-            output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
+    @staticmethod
+    def _media_url(video: dict) -> str:
+        for key in ("play_addr_h264", "play_addr", "download_addr"):
+            urls = (video.get(key) or {}).get("url_list") or []
+            if urls:
+                return urls[0]
+        raise ValueError("该抖音作品没有可下载的视频音轨，暂不支持图文或直播作品")
 
-            video_data = self.fetch_video_info(video_url)
-            output_path = output_path % {
-                "id": video_data['aweme_detail']['aweme_id'],
-                "ext": "mp3",
-            }
-            url = video_data['aweme_detail']['music']['play_url']['uri']
-            # 下载音频
-            audio_data = requests.get(url)
-            with open(output_path, 'wb') as f:
-                f.write(audio_data.content)
-            print(url)
-            tags = []
-            for tag in video_data['aweme_detail']['video_tag']:
-                if tag['tag_name']:
-                    tags.append(tag['tag_name'])
+    def _save_video(self, detail: dict, output_dir: str) -> str:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"{detail['aweme_id']}.mp4")
+        if os.path.isfile(path) and os.path.getsize(path):
+            return path
+        url = self._media_url(detail.get("video") or {})
+        # Media CDNs do not need the account Cookie from www.douyin.com.
+        headers = {key: self.headers_config[key] for key in ("User-Agent", "Referer")}
+        temp_path = None
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=60) as response:
+                if response.status_code >= 400:
+                    raise ValueError(f"抖音视频下载失败：HTTP {response.status_code}")
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
+                    raise ValueError("抖音视频下载返回了验证页面，请刷新 Cookie 后重试")
+                with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".part", delete=False) as stream:
+                    temp_path = stream.name
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+            if not os.path.getsize(temp_path):
+                raise ValueError("抖音视频下载返回空文件")
+            os.replace(temp_path, path)
+        except requests.RequestException:
+            raise ValueError("抖音视频下载失败：网络连接异常或请求超时") from None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        return path
 
-            return AudioDownloadResult(
-                file_path=output_path,
-                title=video_data['aweme_detail']['item_title'],
-                duration=video_data['aweme_detail']['video']['duration'],
-                cover_url=video_data['aweme_detail']['video']['cover_original_scale']['url_list'][0] if
-                video_data['aweme_detail']['video']['cover'] else video_data['video']['big_thumbs']['img_url'],
-                platform="douyin",
-                video_id=video_data['aweme_detail']['aweme_id'],
-                raw_info={
-                    'tags': video_data['aweme_detail']['caption'] + ''.join(tags),
-                },
-                video_path=None  # ❗音频下载不包含视频路径
-            )
-        except Exception as e:
-            raise e
+    def download(self, video_url: str, output_dir: Union[str, None] = None,
+                 quality: DownloadQuality = "fast", need_video: Optional[bool] = False,
+                 skip_download: bool = False) -> AudioDownloadResult:
+        output_dir = output_dir or get_data_dir() or self.cache_data
+        detail = self.fetch_video_info(video_url)["aweme_detail"]
+        video = detail.get("video") or {}
+        video_path = None
+        audio_path = os.path.join(output_dir, f"{detail['aweme_id']}.mp3")
+        if not skip_download:
+            video_path = self._save_video(detail, output_dir)
+            if not os.path.isfile(audio_path) or not os.path.getsize(audio_path):
+                bitrate = {"fast": "64k", "medium": "128k", "slow": "192k"}.get(quality, "128k")
+                with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".mp3", delete=False) as temporary:
+                    temporary_audio = temporary.name
+                try:
+                    subprocess.run(["ffmpeg", "-nostdin", "-y", "-i", video_path,
+                                    "-vn", "-acodec", "libmp3lame", "-b:a", bitrate, temporary_audio],
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if not os.path.getsize(temporary_audio):
+                        raise ValueError("抖音视频音轨提取返回空文件")
+                    os.replace(temporary_audio, audio_path)
+                except (OSError, subprocess.CalledProcessError):
+                    raise ValueError("抖音视频音轨提取失败，请确认 FFmpeg 已安装且视频包含音轨") from None
+                finally:
+                    if os.path.exists(temporary_audio):
+                        os.unlink(temporary_audio)
+        cover_url = None
+        for key in ("cover", "origin_cover", "cover_original_scale", "dynamic_cover"):
+            urls = (video.get(key) or {}).get("url_list") or []
+            if urls:
+                cover_url = urls[0]
+                break
+        tags = [tag.get("tag_name", "") for tag in detail.get("video_tag", [])]
+        return AudioDownloadResult(
+            file_path=audio_path, title=detail.get("item_title") or detail.get("desc") or detail["aweme_id"],
+            duration=(video.get("duration") or 0) / 1000, cover_url=cover_url,
+            platform="douyin", video_id=detail["aweme_id"],
+            raw_info={"tags": " ".join([detail.get("desc", "")] + tags)},
+            video_path=video_path if need_video else None,
+        )
 
     def download_video(self, video_url: str, output_dir: Union[str, None] = None) -> str:
-
-        try:
-
-            if output_dir is None:
-                output_dir = get_data_dir()
-            if not output_dir:
-                output_dir = self.cache_data
-            os.makedirs(output_dir, exist_ok=True)
-
-            video_id = self.extract_video_id(video_url)
-            video_path = os.path.join(output_dir, f"{video_id}.mp4")
-            if os.path.exists(video_path):
-                return video_path
-
-
-            output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
-
-            video_data = self.fetch_video_info(video_url)
-            output_path = output_path % {
-                "id": video_data['aweme_detail']['aweme_id'],
-                "ext": "mp4",
-            }
-
-            url=video_data['aweme_detail']['video']['download_addr']['url_list'][0]
-            _data = requests.get(url,allow_redirects=True,headers=self.headers_config)
-
-            with open(output_path, 'wb') as f:
-                f.write(_data.content)
-
-            return output_path
-        except Exception as e:
-            print("请求失败:", e)
-            raise ValueError("请求失败:", e)
-
-
-
-if __name__ == '__main__':
-    dy = DouyinDownloader(
-        cookie='')
-
-    dy.download(
-        '7.43 11/16 gba:/ j@P.xS 以“马成钢”的视角打开《抓娃娃》笼中鸟，何时飞 # 独白 # 人物故事  https://v.douyin.com/0pcFVdG_lx4/ 复制此链接，打开Dou音搜索，直接观看视频！'
-    )
+        detail = self.fetch_video_info(video_url)["aweme_detail"]
+        return self._save_video(detail, output_dir or get_data_dir() or self.cache_data)

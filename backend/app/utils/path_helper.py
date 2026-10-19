@@ -6,6 +6,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")
 
 
 def get_data_dir():
+    configured = os.getenv("DATA_DIR")
+    if configured:
+        data_path = os.path.abspath(os.path.expanduser(configured))
+        os.makedirs(data_path, exist_ok=True)
+        return data_path
     if getattr(sys, 'frozen', False):
 
         base_dir = os.path.dirname(sys.executable)
@@ -38,6 +43,11 @@ def get_app_dir(subdir: str = "") -> str:
     - 开发时：使用项目 data 目录
     - 打包后：使用 exe 所在目录
     """
+    configured = os.getenv("APP_DATA_DIR")
+    if configured:
+        full_path = os.path.join(os.path.abspath(os.path.expanduser(configured)), subdir)
+        os.makedirs(full_path, exist_ok=True)
+        return full_path
     if getattr(sys, 'frozen', False):
         # 打包后运行：使用 main.exe 所在目录
         base_dir = os.path.dirname(sys.executable)

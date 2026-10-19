@@ -71,7 +71,15 @@ class VideoReader:
 
         try:
             os.makedirs(self.frame_dir, exist_ok=True)
-            duration = float(ffmpeg.probe(self.video_path)["format"]["duration"])
+            try:
+                duration = float(ffmpeg.probe(self.video_path)["format"]["duration"])
+            except FileNotFoundError:
+                # The source desktop bundle includes PyAV and ffmpeg, without a separate ffprobe.
+                import av
+                with av.open(self.video_path) as container:
+                    if container.duration is None:
+                        raise ValueError("无法读取视频时长")
+                    duration = container.duration / 1_000_000
             timestamps = [i for i in range(0, int(duration), self.frame_interval)][:max_frames]
 
             # 并行提取帧
